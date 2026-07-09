@@ -199,6 +199,8 @@ struct iqs9151_data {
     const struct device *dev;
     struct gpio_callback gpio_cb;
     struct k_work work;
+    struct k_work reinit_work;
+    atomic_t reinit_pending;
     struct k_work_delayable one_finger_click_work;
     struct k_work_delayable two_finger_click_work;
     struct k_work_delayable three_finger_click_work;
@@ -1990,6 +1992,23 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
     iqs9151_motion_history_reset(&data->scroll_motion_history);
     iqs9151_motion_history_reset(&data->cursor_motion_history);
     memset(&data->prev_frame, 0, sizeof(data->prev_frame));
+
+    /*
+     * SHOW_RESET means the device itself went through a power-on/brownout
+     * reset (e.g. VDD sag on battery power). All volatile chip-side state
+     * (RX/TX mapping, ATI calibration, event mode) is lost at that point,
+     * so simply clearing our software-side gesture state is not enough:
+     * without re-running the configuration sequence the device stays in
+     * its POR default state and typically stops producing usable events,
+     * which looks like the trackpad "died" until the whole board is power
+     * cycled. Kick off a full reinitialization asynchronously so the
+     * device can recover on its own. Use atomic_cas as a simple "already
+     * queued" guard so repeated SHOW_RESET frames while reinit is in
+     * flight don't pile up extra work items.
+     */
+    if (atomic_cas(&data->reinit_pending, 0, 1)) {
+        k_work_submit(&data->reinit_work);
+    }
     return true;
 }
 
@@ -2601,6 +2620,69 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
     return 0;
 }
 
+/*
+ * Recover from a device-side reset (SHOW_RESET) detected while the driver
+ * is already running. A bare chip reset (e.g. brownout caused by VDD sag
+ * on battery power) wipes the RX/TX map, ATI calibration and event mode,
+ * so we replay the same sequence used at boot in iqs9151_init(). This is
+ * a best-effort mitigation for marginal power rails; it does not fix an
+ * underlying supply that is too close to the device's minimum operating
+ * voltage, and if resets recur frequently the trackpad will keep pausing
+ * for the duration of this routine (dominated by the ATI wait).
+ */
+static void iqs9151_reinit_work_cb(struct k_work *work) {
+    struct iqs9151_data *data = CONTAINER_OF(work, struct iqs9151_data, reinit_work);
+    const struct device *dev = data->dev;
+    const struct iqs9151_config *cfg = dev->config;
+    int ret;
+
+    LOG_WRN("Reinitializing IQS9151 after SHOW_RESET (possible brownout)");
+
+    iqs9151_set_interrupt(dev, false);
+
+    ret = iqs9151_ack_reset(dev);
+    if (ret != 0) {
+        LOG_ERR("Reinit: ack_reset failed (%d)", ret);
+        goto done;
+    }
+
+    ret = iqs9151_configure(dev);
+    if (ret != 0) {
+        LOG_ERR("Reinit: configure failed (%d)", ret);
+        goto done;
+    }
+
+    ret = iqs9151_apply_kconfig_overrides(dev);
+    if (ret != 0) {
+        LOG_ERR("Reinit: kconfig overrides failed (%d)", ret);
+        goto done;
+    }
+
+    ret = iqs9151_run_ati(cfg);
+    if (ret != 0) {
+        LOG_ERR("Reinit: ATI request failed (%d)", ret);
+        goto done;
+    }
+
+    ret = iqs9151_wait_for_ati(dev, IQS9151_ATI_TIMEOUT_MS);
+    if (ret != 0) {
+        LOG_ERR("Reinit: ATI wait failed (%d)", ret);
+        goto done;
+    }
+
+    ret = iqs9151_set_event_mode(dev);
+    if (ret != 0) {
+        LOG_ERR("Reinit: set event mode failed (%d)", ret);
+        goto done;
+    }
+
+    LOG_WRN("IQS9151 reinit after SHOW_RESET complete");
+
+done:
+    iqs9151_set_interrupt(dev, true);
+    atomic_set(&data->reinit_pending, 0);
+}
+
 static int iqs9151_init(const struct device *dev) {
     const struct iqs9151_config *cfg = dev->config;
     struct iqs9151_data *data = dev->data;
@@ -2693,6 +2775,8 @@ static int iqs9151_init(const struct device *dev) {
 
     // Setup IRQ Call Back
     k_work_init(&data->work, iqs9151_work_cb);
+    k_work_init(&data->reinit_work, iqs9151_reinit_work_cb);
+    atomic_clear(&data->reinit_pending);
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
@@ -2751,6 +2835,8 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     memset(data, 0, sizeof(*data));
     data->dev = dev;
     k_work_init(&data->work, iqs9151_work_cb);
+    k_work_init(&data->reinit_work, iqs9151_reinit_work_cb);
+    atomic_clear(&data->reinit_pending);
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
