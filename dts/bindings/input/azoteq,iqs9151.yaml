@@ -11,6 +11,27 @@ properties:
     required: true
     description: Interrupt GPIO for IQS9151 driver.
 
+  power-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO used to control power to the sensor. When present, the
+      driver drives it low, waits ~500ms, then drives it high and waits
+      ~10ms before starting I2C communication (mirroring the power-up
+      sequencing used by the IQS7211E driver), instead of relying on a
+      permanently-on gpio-hog. This matters on supplies with limited
+      inrush tolerance (e.g. small boost converters): presenting the
+      sensor as a load before the rail has stabilized can prevent it from
+      reaching its regulated voltage at all.
+
+      When present, the driver also power-cycles the sensor as part of
+      recovering from an unexpected device-side reset (SHOW_RESET)
+      detected during normal operation, instead of only reconfiguring it
+      over I2C.
+
+      If not provided, the sensor is assumed to be always powered and no
+      GPIO sequencing is performed (previous behavior).
+
   rx-channel:
     type: int
     required: true

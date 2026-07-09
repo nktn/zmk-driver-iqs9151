@@ -37,6 +37,11 @@ LOG_MODULE_REGISTER(iqs9151, CONFIG_INPUT_IQS9151_LOG_LEVEL);
 #define IQS9151_RSTD_DELAY_MS 100
 #define IQS9151_ATI_TIMEOUT_MS 1000
 #define IQS9151_ATI_POLL_INTERVAL_MS 10
+#define IQS9151_POWER_SETTLE_MS 500
+#define IQS9151_POWER_ON_DELAY_MS 10
+#define IQS9151_POWER_CYCLE_OFF_MS 100
+#define IQS9151_REINIT_BACKOFF_INITIAL_S 1
+#define IQS9151_REINIT_BACKOFF_MAX_S 30
 #define INERTIA_FP_SHIFT 8
 #define EMA_FP_SHIFT INERTIA_FP_SHIFT
 #define EMA_ALPHA_DEN (1 << EMA_FP_SHIFT)
@@ -94,6 +99,7 @@ LOG_MODULE_REGISTER(iqs9151, CONFIG_INPUT_IQS9151_LOG_LEVEL);
 struct iqs9151_config {
     struct i2c_dt_spec i2c;
     struct gpio_dt_spec irq_gpio;
+    struct gpio_dt_spec power_gpio;
     uint8_t tx_channel;
     uint8_t rx_channel;
 };
@@ -199,8 +205,9 @@ struct iqs9151_data {
     const struct device *dev;
     struct gpio_callback gpio_cb;
     struct k_work work;
-    struct k_work reinit_work;
+    struct k_work_delayable reinit_work;
     atomic_t reinit_pending;
+    uint32_t reinit_backoff_s;
     struct k_work_delayable one_finger_click_work;
     struct k_work_delayable two_finger_click_work;
     struct k_work_delayable three_finger_click_work;
@@ -2004,10 +2011,12 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
      * cycled. Kick off a full reinitialization asynchronously so the
      * device can recover on its own. Use atomic_cas as a simple "already
      * queued" guard so repeated SHOW_RESET frames while reinit is in
-     * flight don't pile up extra work items.
+     * flight (including while it is backing off between retries) don't
+     * pile up extra work items.
      */
     if (atomic_cas(&data->reinit_pending, 0, 1)) {
-        k_work_submit(&data->reinit_work);
+        data->reinit_backoff_s = 0U;
+        k_work_schedule(&data->reinit_work, K_NO_WAIT);
     }
     return true;
 }
@@ -2621,17 +2630,97 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
 }
 
 /*
+ * Optional power sequencing (power-gpios). Mirrors the IQS7211E driver's
+ * power-up handling: drive the supply low, give it time to settle, then
+ * drive it high and wait a little more before touching the bus. This
+ * matters on supplies with limited inrush tolerance (e.g. a small boost
+ * converter): presenting the sensor as a load before the rail has
+ * stabilized can prevent it from ever reaching its regulated voltage,
+ * as opposed to a permanently-on gpio-hog that powers the sensor the
+ * instant the GPIO subsystem comes up.
+ *
+ * When power-gpios is not present these are no-ops (previous behavior).
+ */
+static int iqs9151_power_up(const struct device *dev) {
+    const struct iqs9151_config *cfg = dev->config;
+    int ret;
+
+    if (!gpio_is_ready_dt(&cfg->power_gpio)) {
+        return 0;
+    }
+
+    ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
+    if (ret != 0) {
+        LOG_ERR("Power pin configuration failed: %d", ret);
+        return ret;
+    }
+
+    k_sleep(K_MSEC(IQS9151_POWER_SETTLE_MS));
+
+    ret = gpio_pin_set_dt(&cfg->power_gpio, 1);
+    if (ret != 0) {
+        LOG_ERR("Power pin set failed: %d", ret);
+        return ret;
+    }
+
+    k_sleep(K_MSEC(IQS9151_POWER_ON_DELAY_MS));
+    return 0;
+}
+
+/*
+ * Power-cycle the sensor as part of recovering from an unexpected
+ * device-side reset. Unlike iqs9151_power_up() this uses a much shorter
+ * off time: the rail is presumably already close to its steady state (we
+ * are recovering mid-operation, not booting cold), we just want to force
+ * a clean drop-out/return in case the sensor is stuck in a marginal state.
+ * No-op when power-gpios is not present.
+ */
+static int iqs9151_power_cycle(const struct device *dev) {
+    const struct iqs9151_config *cfg = dev->config;
+    int ret;
+
+    if (!gpio_is_ready_dt(&cfg->power_gpio)) {
+        return 0;
+    }
+
+    ret = gpio_pin_set_dt(&cfg->power_gpio, 0);
+    if (ret != 0) {
+        LOG_ERR("Power pin off (power cycle) failed: %d", ret);
+        return ret;
+    }
+
+    k_sleep(K_MSEC(IQS9151_POWER_CYCLE_OFF_MS));
+
+    ret = gpio_pin_set_dt(&cfg->power_gpio, 1);
+    if (ret != 0) {
+        LOG_ERR("Power pin on (power cycle) failed: %d", ret);
+        return ret;
+    }
+
+    k_sleep(K_MSEC(IQS9151_POWER_ON_DELAY_MS));
+    return 0;
+}
+
+/*
  * Recover from a device-side reset (SHOW_RESET) detected while the driver
  * is already running. A bare chip reset (e.g. brownout caused by VDD sag
  * on battery power) wipes the RX/TX map, ATI calibration and event mode,
  * so we replay the same sequence used at boot in iqs9151_init(). This is
  * a best-effort mitigation for marginal power rails; it does not fix an
  * underlying supply that is too close to the device's minimum operating
- * voltage, and if resets recur frequently the trackpad will keep pausing
- * for the duration of this routine (dominated by the ATI wait).
+ * voltage.
+ *
+ * If the device is still unresponsive (e.g. VDD hasn't recovered yet) any
+ * step below can fail. In that case we don't just give up: a dead sensor
+ * won't produce another SHOW_RESET frame to retry from, so we instead
+ * reschedule ourselves with an exponential backoff (capped) until either
+ * the sequence succeeds or the caller reboots the board. The interrupt
+ * stays disabled for the whole retry window since the device isn't in a
+ * known-good state.
  */
 static void iqs9151_reinit_work_cb(struct k_work *work) {
-    struct iqs9151_data *data = CONTAINER_OF(work, struct iqs9151_data, reinit_work);
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, reinit_work);
     const struct device *dev = data->dev;
     const struct iqs9151_config *cfg = dev->config;
     int ret;
@@ -2640,47 +2729,64 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
 
     iqs9151_set_interrupt(dev, false);
 
+    ret = iqs9151_power_cycle(dev);
+    if (ret != 0) {
+        LOG_ERR("Reinit: power cycle failed (%d)", ret);
+        goto retry;
+    }
+
     ret = iqs9151_ack_reset(dev);
     if (ret != 0) {
         LOG_ERR("Reinit: ack_reset failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     ret = iqs9151_configure(dev);
     if (ret != 0) {
         LOG_ERR("Reinit: configure failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     ret = iqs9151_apply_kconfig_overrides(dev);
     if (ret != 0) {
         LOG_ERR("Reinit: kconfig overrides failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     ret = iqs9151_run_ati(cfg);
     if (ret != 0) {
         LOG_ERR("Reinit: ATI request failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     ret = iqs9151_wait_for_ati(dev, IQS9151_ATI_TIMEOUT_MS);
     if (ret != 0) {
         LOG_ERR("Reinit: ATI wait failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     ret = iqs9151_set_event_mode(dev);
     if (ret != 0) {
         LOG_ERR("Reinit: set event mode failed (%d)", ret);
-        goto done;
+        goto retry;
     }
 
     LOG_WRN("IQS9151 reinit after SHOW_RESET complete");
-
-done:
+    data->reinit_backoff_s = 0U;
     iqs9151_set_interrupt(dev, true);
     atomic_set(&data->reinit_pending, 0);
+    return;
+
+retry:
+    data->reinit_backoff_s = (data->reinit_backoff_s == 0U)
+                                 ? IQS9151_REINIT_BACKOFF_INITIAL_S
+                                 : MIN(data->reinit_backoff_s * 2U,
+                                       (uint32_t)IQS9151_REINIT_BACKOFF_MAX_S);
+    LOG_WRN("IQS9151 reinit failed, retrying in %u s", data->reinit_backoff_s);
+    /* reinit_pending stays set: a retry is still in flight, so a fresh
+     * SHOW_RESET frame (unlikely from a device this unresponsive, but
+     * possible) won't spawn a second, overlapping retry chain. */
+    k_work_reschedule(dwork, K_SECONDS(data->reinit_backoff_s));
 }
 
 static int iqs9151_init(const struct device *dev) {
@@ -2709,8 +2815,18 @@ static int iqs9151_init(const struct device *dev) {
         return ret;
     }
 
+    // Power up the sensor (no-op if power-gpios isn't provided). Done
+    // after the IRQ pin is configured as an input so it's ready to sense
+    // RDY transitions as soon as the sensor comes up, and before any I2C
+    // traffic since the sensor obviously needs to be powered for that.
+    ret = iqs9151_power_up(dev);
+    if (ret != 0) {
+        LOG_ERR("Power up failed: %d", ret);
+        return ret;
+    }
+
     iqs9151_wait_for_ready(dev, 500);
-    
+
     // Check Product Number
     ret = iqs9151_check_product_number(dev);
     if (ret != 0) {
@@ -2775,8 +2891,9 @@ static int iqs9151_init(const struct device *dev) {
 
     // Setup IRQ Call Back
     k_work_init(&data->work, iqs9151_work_cb);
-    k_work_init(&data->reinit_work, iqs9151_reinit_work_cb);
+    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     atomic_clear(&data->reinit_pending);
+    data->reinit_backoff_s = 0U;
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
@@ -2835,8 +2952,9 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     memset(data, 0, sizeof(*data));
     data->dev = dev;
     k_work_init(&data->work, iqs9151_work_cb);
-    k_work_init(&data->reinit_work, iqs9151_reinit_work_cb);
+    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     atomic_clear(&data->reinit_pending);
+    data->reinit_backoff_s = 0U;
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
@@ -2939,6 +3057,7 @@ void iqs9151_test_force_pinch_session(void *ctx, bool active) {
     static const struct iqs9151_config iqs9151_config_##inst = {    \
         .i2c = I2C_DT_SPEC_INST_GET(inst),                                      \
         .irq_gpio = GPIO_DT_SPEC_INST_GET(inst, irq_gpios),                     \
+        .power_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, power_gpios, {0}),         \
         .tx_channel = DT_INST_PROP_OR(inst, tx_channel, 11),                    \
         .rx_channel = DT_INST_PROP_OR(inst, rx_channel, 11),                    \
   };                                                                          \
