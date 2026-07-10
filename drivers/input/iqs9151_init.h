@@ -50,7 +50,14 @@
 /* ATI Multipliers / Dividers */
 /* Memory Map Position 0x117A - 0x1195 */
 #define TP_ATI_MULTDIV_L                         0x21
-#define TP_ATI_MULTDIV_H                         0x53
+/* b4ef799 bumped this to 0x53 for the reference hardware, but on a
+ * generator-built 7x7 pad that gain makes ATI fail to converge: the
+ * info flags show ATI Error (0x0008) and a phantom touch appears
+ * pinned at the resolution edge (y=1538 vs y_resolution=1536), which
+ * keeps finger_count at 2 and suppresses the chip's Relative X/Y
+ * output entirely (per datasheet 7.2.2 it is one-finger-only).
+ * Revert to the pre-b4ef799 gain that worked on this pad. */
+#define TP_ATI_MULTDIV_H                         0x4D
 #define ALP_ATI_COARSE_RX0_L                     0x87
 #define ALP_ATI_COARSE_RX0_H                     0x5A
 #define ALP_ATI_COARSE_RX1_L                     0x87
