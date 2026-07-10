@@ -2339,13 +2339,31 @@ static void iqs9151_work_cb(struct k_work *work) {
     ret = iqs9151_read_frame(cfg, &frame);
     if (ret != 0) {
         LOG_ERR("frame read failed (%d)", ret);
-        (void)iqs9151_set_interrupt(dev, true);
+        /* Don't race with a reinit that may already be in flight (e.g. this
+         * read itself failed because the device just browned out): leave
+         * the interrupt off in that case, iqs9151_reinit_work_cb() is
+         * responsible for re-enabling it once recovery succeeds. */
+        if (atomic_get(&data->reinit_pending) == 0) {
+            (void)iqs9151_set_interrupt(dev, true);
+        }
         return;
     }
 
     iqs9151_process_frame(data, &frame, now_ms);
 
-    (void)iqs9151_set_interrupt(dev, true);
+    /*
+     * iqs9151_process_frame() -> iqs9151_handle_show_reset() may have just
+     * scheduled iqs9151_reinit_work_cb(), which wants the interrupt to stay
+     * disabled until the device is fully reconfigured (its RX/TX map, ATI
+     * calibration and event mode are unknown/invalid immediately after a
+     * SHOW_RESET). Blindly re-enabling it here would let a still-asserted
+     * (level-triggered) RDY line refire immediately and race a fresh
+     * iqs9151_work_cb() against the in-progress reinit sequence on the same
+     * I2C bus.
+     */
+    if (atomic_get(&data->reinit_pending) == 0) {
+        (void)iqs9151_set_interrupt(dev, true);
+    }
 }
 
 static void iqs9151_gpio_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
