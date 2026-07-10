@@ -31,6 +31,7 @@
 |`CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_SPEED`|int|`30`|Dynamic Filter Bottom Speed（有効域 `0..2047`）|
 |`CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_TOP_SPEED`|int|`511`|Dynamic Filter Top Speed（有効域 `0..2047`）|
 |`CONFIG_INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_BETA`|int|`20`|Dynamic Filter Bottom Beta|
+|`CONFIG_INPUT_IQS9151_ACTIVE_SAMPLING_PERIOD_MS`|int|`0`|Activeモードサンプリング周期(ms)上書き(0x11A2、有効域 `0..100`)。`0`=上書きなし(既定)。BLE接続間隔に運びきれない報告レートによるカーソルの飛び/停止を防止|
 
 ## 4. Gesture Detection and Thresholds
 

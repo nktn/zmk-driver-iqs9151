@@ -103,6 +103,21 @@ config INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_BETA
       XY Dynamic Filter Bottom Beta (0x11EE).
       Currently not applied by the driver.
 
+config INPUT_IQS9151_ACTIVE_SAMPLING_PERIOD_MS
+    int "IQS9151 Active mode sampling period override (ms)"
+    range 0 100
+    default 0
+    help
+      Override the Active mode sampling period (register 0x11A2, ms
+      units). 0 leaves it at the device's own default (chip default is
+      about 11ms, i.e. ~90 reports/sec).
+      On BLE, the connection interval (typically 15-30ms) often cannot
+      carry reports at that default rate: the ZMK BLE TX queue overflows
+      and silently drops movement reports, which shows up as a cursor
+      that barely moves, or jumps in large steps, over a BLE connection.
+      Lowering this to something the connection interval can actually
+      carry (e.g. 15-20ms) avoids that report-rate mismatch.
+
 config INPUT_IQS9151_FINGER_COUNT_DEBOUNCE_MS
     int "IQS9151 finger-count release debounce (ms)"
     range 0 100

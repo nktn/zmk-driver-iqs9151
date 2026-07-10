@@ -2918,6 +2918,23 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
         return ret;
     }
 
+    /*
+     * 0 (default) leaves the Active mode sampling period at the device's
+     * own default. Overriding it is mainly useful over BLE, where the
+     * connection interval (15-30ms) can be slower than the chip's default
+     * ~11ms sampling period; without this the ZMK BLE TX queue overflows
+     * and silently drops movement reports, which looks like a cursor that
+     * barely moves or jumps in large steps.
+     */
+    if (CONFIG_INPUT_IQS9151_ACTIVE_SAMPLING_PERIOD_MS >= 1) {
+        ret = iqs9151_write_u16(cfg, IQS9151_ADDR_ACTIVE_MODE_SAMPLING_PERIOD,
+                                (uint16_t)CONFIG_INPUT_IQS9151_ACTIVE_SAMPLING_PERIOD_MS);
+        if (ret != 0) {
+            LOG_ERR("Failed to apply active mode sampling period (%d)", ret);
+            return ret;
+        }
+    }
+
     return 0;
 }
 

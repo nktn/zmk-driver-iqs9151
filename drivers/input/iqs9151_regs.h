@@ -38,7 +38,8 @@
 #define IQS9151_ADDR_ATI_MULTIPLIERS           0x117A
 #define IQS9151_ADDR_ATI_SETTINGS              0x1196
 #define IQS9151_ADDR_TRACKPAD_ATI_TARGET       0x1196
-#define IQS9151_ADDR_DEVICE_CONFIG             0x11A2
+/* Active Mode Sampling Period (ms), 2 bytes. See Section 6.1. */
+#define IQS9151_ADDR_ACTIVE_MODE_SAMPLING_PERIOD 0x11A2
 #define IQS9151_ADDR_SYSTEM_CONTROL            0x11BC
 #define IQS9151_ADDR_CONFIG_SETTINGS           0x11BE
 #define IQS9151_ADDR_OTHER_SETTINGS            0x11C0
