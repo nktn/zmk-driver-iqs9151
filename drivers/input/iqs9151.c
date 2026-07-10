@@ -2733,6 +2733,15 @@ static int iqs9151_power_cycle(const struct device *dev) {
     }
 
     k_sleep(K_MSEC(IQS9151_POWER_ON_DELAY_MS));
+
+    // Wait for RDY the same way iqs9151_init() does after powering on.
+    // IQS9151_POWER_ON_DELAY_MS alone is nowhere near enough for the chip
+    // to complete its boot sequence, so touching the I2C bus right after
+    // it reliably NACKs (observed on real hardware: every reinit-after-
+    // SHOW_RESET attempt failed at ack_reset with -EIO until this wait
+    // was added).
+    iqs9151_wait_for_ready(dev, 500);
+
     return 0;
 }
 
@@ -2764,10 +2773,24 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
 
     iqs9151_set_interrupt(dev, false);
 
-    ret = iqs9151_power_cycle(dev);
-    if (ret != 0) {
-        LOG_ERR("Reinit: power cycle failed (%d)", ret);
-        goto retry;
+    /*
+     * SHOW_RESET is only detected by successfully reading a frame, so the
+     * I2C link is known-good at this point -- the chip isn't actually
+     * gone, it just lost its RX/TX map, ATI calibration and event mode
+     * across its own reset. Power-cycling a chip we can already talk to
+     * is counterproductive on the first attempt: it throws away a working
+     * link and forces the chip back through its power-on boot sequence,
+     * which is exactly the state iqs9151_wait_for_ready() exists to wait
+     * out. So skip the power cycle on the first attempt and go straight
+     * to reconfiguring; only fall back to a full power cycle on later
+     * attempts, in case the device really is stuck in a marginal state.
+     */
+    if (data->reinit_attempts > 0U) {
+        ret = iqs9151_power_cycle(dev);
+        if (ret != 0) {
+            LOG_ERR("Reinit: power cycle failed (%d)", ret);
+            goto retry;
+        }
     }
 
     ret = iqs9151_ack_reset(dev);
