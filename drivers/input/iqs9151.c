@@ -208,9 +208,16 @@ struct iqs9151_motion_history {
 /*
  * Tracks the debounced ("confirmed") finger count separately from the raw
  * value read from the sensor this frame. See iqs9151_finger_count_debounce_apply().
+ *
+ * pending_raw is the most recently observed raw finger_count while a
+ * decrease is pending: the sensor runs in event mode and (normally) sends a
+ * single frame on release before going quiet, so there may be no further
+ * frame to read this from once the debounce timer (finger_count_debounce_work
+ * in iqs9151_data) actually confirms the decrease.
  */
 struct iqs9151_finger_count_debounce {
     uint8_t confirmed;
+    uint8_t pending_raw;
     bool decrease_pending;
     int64_t decrease_since_ms;
     int64_t last_stable_ms;
@@ -229,6 +236,7 @@ struct iqs9151_data {
     struct k_work_delayable three_finger_click_work;
     struct k_work_delayable inertia_scroll_work;
     struct k_work_delayable inertia_cursor_work;
+    struct k_work_delayable finger_count_debounce_work;
     struct iqs9151_inertia_state inertia_scroll;
     struct iqs9151_inertia_state inertia_cursor;
     int32_t scroll_ema_x_fp;
@@ -935,11 +943,15 @@ static void iqs9151_reset_finger_history(struct iqs9151_data *data) {
     data->finger_history_count = 0U;
 }
 
-static void iqs9151_finger_count_debounce_reset(struct iqs9151_finger_count_debounce *state) {
+static void iqs9151_finger_count_debounce_reset(struct iqs9151_data *data) {
+    struct iqs9151_finger_count_debounce *state = &data->finger_count_debounce;
+
     state->confirmed = 0U;
+    state->pending_raw = 0U;
     state->decrease_pending = false;
     state->decrease_since_ms = 0;
     state->last_stable_ms = 0;
+    (void)k_work_cancel_delayable(&data->finger_count_debounce_work);
 }
 
 static void iqs9151_push_finger_history(struct iqs9151_data *data,
@@ -2040,7 +2052,7 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
     iqs9151_motion_history_reset(&data->scroll_motion_history);
     iqs9151_motion_history_reset(&data->cursor_motion_history);
     memset(&data->prev_frame, 0, sizeof(data->prev_frame));
-    iqs9151_finger_count_debounce_reset(&data->finger_count_debounce);
+    iqs9151_finger_count_debounce_reset(data);
 
     /*
      * SHOW_RESET means the device itself went through a power-on/brownout
@@ -2324,12 +2336,22 @@ static void iqs9151_report_frame_events(const struct device *dev,
  * touches (spurious taps/double-clicks, reset drag/scroll tracking).
  *
  * An increase (or unchanged value) relative to the previously confirmed
- * count is always accepted immediately. A decrease is only committed once it
- * has been observed continuously for FINGER_COUNT_DEBOUNCE_MS; until then
- * this returns the previously confirmed (higher) count. If the raw count
- * recovers to that confirmed value (or higher) before the debounce window
- * elapses, the pending decrease is dropped, i.e. the chatter is treated as
- * if it never happened.
+ * count is always accepted immediately (and cancels/supersedes any pending
+ * decrease). A decrease is only committed once it has been observed
+ * continuously for FINGER_COUNT_DEBOUNCE_MS; until then this returns the
+ * previously confirmed (higher) count. If the raw count recovers to that
+ * confirmed value (or higher) before the debounce window elapses, the
+ * pending decrease is dropped, i.e. the chatter is treated as if it never
+ * happened.
+ *
+ * The IQS9151 runs in event mode: on a real release it (normally) sends a
+ * single lower-finger_count frame and then goes quiet until the next touch,
+ * so there is often no further frame to advance this function past the
+ * debounce window. iqs9151_finger_count_debounce_work_cb(), scheduled here
+ * when a decrease first becomes pending, is what actually confirms the
+ * decrease in that case; this function only cancels/re-resolves it when a
+ * new frame does arrive first (recovery, or a frame that happens to land at
+ * or after the deadline).
  *
  * *touch_end_ms receives the timestamp to use as the "touch ended" reference
  * for tap-duration checks in the caller. If this call is the one committing
@@ -2340,15 +2362,21 @@ static void iqs9151_report_frame_events(const struct device *dev,
  * (e.g. CONFIG_INPUT_IQS9151_1F_TAP_MAX_MS) measures. Otherwise (no delay
  * was actually introduced -- in particular whenever
  * FINGER_COUNT_DEBOUNCE_MS == 0, where a decrease always commits on the same
- * frame it is first observed) it is a fresh k_uptime_get() timestamp, i.e.
- * exactly what the caller's own duration checks fetched before this
- * debounce existed, matching pre-existing (non-debounced) behavior exactly.
+ * frame it is first observed, and the work item below is never scheduled)
+ * it is a fresh k_uptime_get() timestamp, i.e. exactly what the caller's own
+ * duration checks fetched before this debounce existed, matching
+ * pre-existing (non-debounced) behavior exactly.
  */
-static uint8_t iqs9151_finger_count_debounce_apply(struct iqs9151_finger_count_debounce *state,
+static uint8_t iqs9151_finger_count_debounce_apply(struct iqs9151_data *data,
                                                    uint8_t raw_finger_count,
                                                    int64_t now_ms,
                                                    int64_t *touch_end_ms) {
+    struct iqs9151_finger_count_debounce *state = &data->finger_count_debounce;
+
     if (raw_finger_count >= state->confirmed) {
+        if (state->decrease_pending) {
+            (void)k_work_cancel_delayable(&data->finger_count_debounce_work);
+        }
         state->confirmed = raw_finger_count;
         state->decrease_pending = false;
         state->last_stable_ms = now_ms;
@@ -2356,9 +2384,17 @@ static uint8_t iqs9151_finger_count_debounce_apply(struct iqs9151_finger_count_d
         return state->confirmed;
     }
 
+    state->pending_raw = raw_finger_count;
+
     if (!state->decrease_pending) {
         state->decrease_pending = true;
         state->decrease_since_ms = now_ms;
+        if (FINGER_COUNT_DEBOUNCE_MS > 0) {
+            /* No follow-up frame may ever arrive to resolve this (event
+             * mode, see function comment above): let the timer do it. */
+            k_work_reschedule(&data->finger_count_debounce_work,
+                              K_MSEC(FINGER_COUNT_DEBOUNCE_MS));
+        }
     }
 
     if ((now_ms - state->decrease_since_ms) < FINGER_COUNT_DEBOUNCE_MS) {
@@ -2368,7 +2404,14 @@ static uint8_t iqs9151_finger_count_debounce_apply(struct iqs9151_finger_count_d
         return state->confirmed;
     }
 
-    /* Sustained for the full debounce window: commit the decrease. */
+    /*
+     * Sustained for the full debounce window: a new frame happened to land
+     * at/after the deadline, so commit the decrease here and cancel the
+     * timer so it doesn't fire (and commit again) afterwards.
+     */
+    if (FINGER_COUNT_DEBOUNCE_MS > 0) {
+        (void)k_work_cancel_delayable(&data->finger_count_debounce_work);
+    }
     if (state->decrease_since_ms == now_ms) {
         /*
          * No debounce delay actually happened this call (decrease_since_ms
@@ -2395,19 +2438,131 @@ static uint8_t iqs9151_finger_count_debounce_apply(struct iqs9151_finger_count_d
     return state->confirmed;
 }
 
-static void iqs9151_process_frame(struct iqs9151_data *data,
-                                  const struct iqs9151_frame *frame,
-                                  int64_t now_ms) {
+/*
+ * Runs the whole gesture pipeline for a single already-debounced frame (i.e.
+ * finger_count is already the confirmed value, never a raw value still
+ * pending debounce). Shared by the normal per-frame path (iqs9151_process_frame(),
+ * called from iqs9151_work_cb() on every sensor frame) and by the debounce
+ * timer path (iqs9151_finger_count_debounce_work_cb(), which confirms a
+ * pending decrease that no follow-up frame ever arrived to resolve).
+ */
+static void iqs9151_process_debounced_frame(struct iqs9151_data *data,
+                                            const struct iqs9151_frame *debounced_frame,
+                                            int64_t touch_end_ms,
+                                            int64_t now_ms) {
     const struct device *dev = data->dev;
     const struct iqs9151_frame prev_frame = data->prev_frame;
-    struct iqs9151_frame debounced_frame;
     struct iqs9151_two_finger_result two_result;
-    int64_t touch_end_ms = now_ms;
-    bool cursor_moving;
+    const bool cursor_moving =
+        (debounced_frame->trackpad_flags & IQS9151_TP_MOVEMENT_DETECTED) != 0U;
     bool released_from_hold;
     bool suppress_cursor_tail;
 
     iqs9151_two_finger_result_reset(&two_result);
+
+    released_from_hold = iqs9151_update_gesture_sessions(data, debounced_frame, &prev_frame,
+                                                         touch_end_ms, &two_result);
+    suppress_cursor_tail =
+        iqs9151_should_suppress_cursor_for_two_finger_tail(data, debounced_frame, &prev_frame,
+                                                           &two_result);
+
+    if (debounced_frame->finger_count == 3U || data->three_active) {
+        iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
+        iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
+        iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
+        iqs9151_ema_reset(&data->cursor_ema_x_fp, &data->cursor_ema_y_fp);
+        iqs9151_motion_history_reset(&data->scroll_motion_history);
+        iqs9151_motion_history_reset(&data->cursor_motion_history);
+    }
+
+    if (data->one_finger.active && data->one_finger.hold_sent) {
+        iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
+        iqs9151_motion_history_reset(&data->cursor_motion_history);
+    }
+
+    iqs9151_report_frame_events(dev, debounced_frame, &two_result, cursor_moving,
+                                suppress_cursor_tail);
+
+    LOG_DBG("rel x=%d y=%d info=0x%04x tp=0x%04x finger=%d f1x=%u f1y=%u f2x=%u f2y=%u",
+            debounced_frame->rel_x, debounced_frame->rel_y, debounced_frame->info_flags,
+            debounced_frame->trackpad_flags, debounced_frame->finger_count,
+            debounced_frame->finger1_x, debounced_frame->finger1_y,
+            debounced_frame->finger2_x, debounced_frame->finger2_y);
+    LOG_DBG("gesture_state: hold_button=0x%04x 2f_mode=%d",
+            data->hold_button,
+            data->two_finger.mode);
+
+    iqs9151_update_inertia_ema(data, debounced_frame, &prev_frame, &two_result, now_ms,
+                               released_from_hold, cursor_moving,
+                               suppress_cursor_tail);
+    iqs9151_update_prev_frame(data, debounced_frame, &prev_frame);
+    iqs9151_push_finger_history(data, debounced_frame->finger_count, now_ms);
+}
+
+/*
+ * Fires FINGER_COUNT_DEBOUNCE_MS after a finger-count decrease first became
+ * pending in iqs9151_finger_count_debounce_apply(), *if* no follow-up frame
+ * resolved (committed or cancelled) it first -- which, on this event-mode
+ * sensor, is the common case for a real release: the sensor (normally) sends
+ * a single lower-finger_count frame and then goes quiet until the next
+ * touch, so there is nothing left to advance the debounce past its window.
+ * Without this timer a pending decrease could never be confirmed, and the
+ * next touch's raw finger_count recovering back up would simply cancel it,
+ * silently merging two separate touches into what looks like one long touch
+ * -- release/tap processing (and thus all clicks) would never run.
+ *
+ * This runs on the system work queue, same as iqs9151_work_cb() (the normal
+ * frame handler) and every other delayed work in this driver; the queue
+ * serializes them onto one thread, so this can never run concurrently with
+ * frame processing (see iqs9151_finger_count_debounce_apply(), which cancels
+ * this work whenever a frame resolves the pending decrease first).
+ */
+static void iqs9151_finger_count_debounce_work_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs9151_data *data =
+        CONTAINER_OF(dwork, struct iqs9151_data, finger_count_debounce_work);
+    struct iqs9151_finger_count_debounce *state = &data->finger_count_debounce;
+    struct iqs9151_frame debounced_frame;
+    const int64_t now_ms = k_uptime_get();
+    int64_t touch_end_ms;
+
+    if (!state->decrease_pending) {
+        /* Already resolved by a frame in the meantime; nothing to do. */
+        return;
+    }
+
+    touch_end_ms = state->last_stable_ms;
+    state->confirmed = state->pending_raw;
+    state->decrease_pending = false;
+    state->last_stable_ms = now_ms;
+
+    LOG_DBG("finger-count debounce timer fired: confirming finger_count=%u "
+            "(no follow-up frame arrived)",
+            state->confirmed);
+
+    /*
+     * There is no new raw frame to build this release event from (that's
+     * exactly why this timer exists). Synthesize one from the last
+     * processed frame (data->prev_frame already holds the last known-good
+     * coordinates/flags for exactly this reason) with finger_count
+     * overridden to the newly confirmed value. Clear the movement-detected
+     * flag and relative deltas so it can't be mistaken for a fresh motion
+     * sample.
+     */
+    debounced_frame = data->prev_frame;
+    debounced_frame.finger_count = state->confirmed;
+    debounced_frame.rel_x = 0;
+    debounced_frame.rel_y = 0;
+    debounced_frame.trackpad_flags &= (uint16_t)~IQS9151_TP_MOVEMENT_DETECTED;
+
+    iqs9151_process_debounced_frame(data, &debounced_frame, touch_end_ms, now_ms);
+}
+
+static void iqs9151_process_frame(struct iqs9151_data *data,
+                                  const struct iqs9151_frame *frame,
+                                  int64_t now_ms) {
+    struct iqs9151_frame debounced_frame;
+    int64_t touch_end_ms = now_ms;
 
     if (iqs9151_handle_show_reset(data, frame)) {
         return;
@@ -2425,47 +2580,12 @@ static void iqs9151_process_frame(struct iqs9151_data *data,
      */
     debounced_frame = *frame;
     debounced_frame.finger_count = iqs9151_finger_count_debounce_apply(
-        &data->finger_count_debounce, frame->finger_count, now_ms, &touch_end_ms);
+        data, frame->finger_count, now_ms, &touch_end_ms);
 
-    cursor_moving = (debounced_frame.trackpad_flags & IQS9151_TP_MOVEMENT_DETECTED) != 0U;
+    LOG_DBG("raw finger_count=%d debounced to %d", frame->finger_count,
+            debounced_frame.finger_count);
 
-    released_from_hold = iqs9151_update_gesture_sessions(data, &debounced_frame, &prev_frame,
-                                                         touch_end_ms, &two_result);
-    suppress_cursor_tail =
-        iqs9151_should_suppress_cursor_for_two_finger_tail(data, &debounced_frame, &prev_frame,
-                                                           &two_result);
-
-    if (debounced_frame.finger_count == 3U || data->three_active) {
-        iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
-        iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
-        iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
-        iqs9151_ema_reset(&data->cursor_ema_x_fp, &data->cursor_ema_y_fp);
-        iqs9151_motion_history_reset(&data->scroll_motion_history);
-        iqs9151_motion_history_reset(&data->cursor_motion_history);
-    }
-
-    if (data->one_finger.active && data->one_finger.hold_sent) {
-        iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
-        iqs9151_motion_history_reset(&data->cursor_motion_history);
-    }
-
-    iqs9151_report_frame_events(dev, &debounced_frame, &two_result, cursor_moving,
-                                suppress_cursor_tail);
-
-    LOG_DBG("rel x=%d y=%d info=0x%04x tp=0x%04x finger=%d(raw=%d) f1x=%u f1y=%u f2x=%u f2y=%u",
-            debounced_frame.rel_x, debounced_frame.rel_y, debounced_frame.info_flags,
-            debounced_frame.trackpad_flags, debounced_frame.finger_count, frame->finger_count,
-            debounced_frame.finger1_x, debounced_frame.finger1_y,
-            debounced_frame.finger2_x, debounced_frame.finger2_y);
-    LOG_DBG("gesture_state: hold_button=0x%04x 2f_mode=%d",
-            data->hold_button,
-            data->two_finger.mode);
-
-    iqs9151_update_inertia_ema(data, &debounced_frame, &prev_frame, &two_result, now_ms,
-                               released_from_hold, cursor_moving,
-                               suppress_cursor_tail);
-    iqs9151_update_prev_frame(data, &debounced_frame, &prev_frame);
-    iqs9151_push_finger_history(data, debounced_frame.finger_count, now_ms);
+    iqs9151_process_debounced_frame(data, &debounced_frame, touch_end_ms, now_ms);
 }
 
 static int iqs9151_set_interrupt(const struct device *dev, const bool en);
@@ -3119,6 +3239,7 @@ static int iqs9151_init(const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
+    k_work_init_delayable(&data->finger_count_debounce_work, iqs9151_finger_count_debounce_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
@@ -3137,7 +3258,7 @@ static int iqs9151_init(const struct device *dev) {
     iqs9151_three_finger_reset(data);
     data->hold_button = 0U;
     iqs9151_reset_finger_history(data);
-    iqs9151_finger_count_debounce_reset(&data->finger_count_debounce);
+    iqs9151_finger_count_debounce_reset(data);
     gpio_init_callback(&data->gpio_cb, iqs9151_gpio_cb,
                         BIT(cfg->irq_gpio.pin));
     ret = gpio_add_callback(cfg->irq_gpio.port, &data->gpio_cb);
@@ -3182,6 +3303,7 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
+    k_work_init_delayable(&data->finger_count_debounce_work, iqs9151_finger_count_debounce_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
@@ -3200,7 +3322,7 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     iqs9151_three_finger_reset(data);
     data->hold_button = 0U;
     iqs9151_reset_finger_history(data);
-    iqs9151_finger_count_debounce_reset(&data->finger_count_debounce);
+    iqs9151_finger_count_debounce_reset(data);
 }
 
 void iqs9151_test_cancel_pending_work(void *ctx) {
@@ -3211,6 +3333,7 @@ void iqs9151_test_cancel_pending_work(void *ctx) {
     (void)k_work_cancel_delayable(&data->three_finger_click_work);
     (void)k_work_cancel_delayable(&data->inertia_scroll_work);
     (void)k_work_cancel_delayable(&data->inertia_cursor_work);
+    (void)k_work_cancel_delayable(&data->finger_count_debounce_work);
     (void)k_work_cancel(&data->work);
 }
 
