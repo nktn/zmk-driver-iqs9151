@@ -103,6 +103,21 @@ config INPUT_IQS9151_DYNAMIC_FILTER_BOTTOM_BETA
       XY Dynamic Filter Bottom Beta (0x11EE).
       Currently not applied by the driver.
 
+config INPUT_IQS9151_FINGER_COUNT_DEBOUNCE_MS
+    int "IQS9151 finger-count release debounce (ms)"
+    range 0 100
+    default 0
+    help
+      Debounce for decreases in the reported finger count (i.e. fingers
+      being lifted). A decrease is only accepted once it has been observed
+      continuously for this many ms; until then the previously confirmed
+      (higher) finger count is kept. Increases are always accepted
+      immediately. This filters out brief touch-detection chatter (a
+      single physical touch reporting finger_count 1 -> 0 -> 1 for a few
+      frames) that would otherwise be seen as separate touches, causing
+      spurious taps/double-clicks and resetting drag/scroll tracking.
+      0 disables the debounce (default, matches pre-existing behavior).
+
 config INPUT_IQS9151_1F_TAP_ENABLE
     bool "IQS9151 single-finger tap enable"
     default y

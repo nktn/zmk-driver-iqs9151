@@ -36,6 +36,7 @@
 
 |Symbol|Type|Default|役割|
 | - | - | - | - |
+|`CONFIG_INPUT_IQS9151_FINGER_COUNT_DEBOUNCE_MS`|int|`0`|finger_count 減少方向のデバウンス時間（有効域 `0..100`）。瞬断によるチャタリングでの誤タップ・ドラッグ/スクロール追跡リセットを防止|
 |`CONFIG_INPUT_IQS9151_1F_TAP_ENABLE`|bool|`y`|1F Tap 有効/無効|
 |`CONFIG_INPUT_IQS9151_1F_TAP_MAX_MS`|int|`250`|1F Tap/2回目Tap 判定の最大時間|
 |`CONFIG_INPUT_IQS9151_1F_TAP_MOVE`|int|`50`|1F Tap 移動しきい値|
