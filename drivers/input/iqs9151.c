@@ -42,6 +42,9 @@ LOG_MODULE_REGISTER(iqs9151, CONFIG_INPUT_IQS9151_LOG_LEVEL);
 #define IQS9151_POWER_CYCLE_OFF_MS 100
 #define IQS9151_REINIT_BACKOFF_INITIAL_S 1
 #define IQS9151_REINIT_BACKOFF_MAX_S 30
+/* 1,2,4,8,16,30,30 s of backoff across 7 failed attempts (~1.5 minutes)
+ * before giving up; see iqs9151_reinit_work_cb(). */
+#define IQS9151_REINIT_MAX_ATTEMPTS 8
 #define INERTIA_FP_SHIFT 8
 #define EMA_FP_SHIFT INERTIA_FP_SHIFT
 #define EMA_ALPHA_DEN (1 << EMA_FP_SHIFT)
@@ -208,6 +211,7 @@ struct iqs9151_data {
     struct k_work_delayable reinit_work;
     atomic_t reinit_pending;
     uint32_t reinit_backoff_s;
+    uint32_t reinit_attempts;
     struct k_work_delayable one_finger_click_work;
     struct k_work_delayable two_finger_click_work;
     struct k_work_delayable three_finger_click_work;
@@ -2016,6 +2020,7 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
      */
     if (atomic_cas(&data->reinit_pending, 0, 1)) {
         data->reinit_backoff_s = 0U;
+        data->reinit_attempts = 0U;
         k_work_schedule(&data->reinit_work, K_NO_WAIT);
     }
     return true;
@@ -2803,16 +2808,40 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
 
     LOG_WRN("IQS9151 reinit after SHOW_RESET complete");
     data->reinit_backoff_s = 0U;
+    data->reinit_attempts = 0U;
     iqs9151_set_interrupt(dev, true);
     atomic_set(&data->reinit_pending, 0);
     return;
 
 retry:
+    data->reinit_attempts++;
+    if (data->reinit_attempts >= IQS9151_REINIT_MAX_ATTEMPTS) {
+        /*
+         * Give up on retrying rather than keep the interrupt disabled
+         * forever behind an unbounded loop: whatever is failing here isn't
+         * being fixed by trying the exact same sequence again, and a
+         * silently-stuck-forever trackpad is worse than one that at least
+         * goes back to listening for events (which may still work, e.g. if
+         * the actual fault was transient and has since cleared on its own,
+         * or if only one step of the reinit sequence is problematic while
+         * the sensor itself is otherwise fine).
+         */
+        LOG_ERR("IQS9151 reinit gave up after %u attempts, re-enabling "
+                "interrupt anyway",
+                data->reinit_attempts);
+        data->reinit_backoff_s = 0U;
+        data->reinit_attempts = 0U;
+        iqs9151_set_interrupt(dev, true);
+        atomic_set(&data->reinit_pending, 0);
+        return;
+    }
+
     data->reinit_backoff_s = (data->reinit_backoff_s == 0U)
                                  ? IQS9151_REINIT_BACKOFF_INITIAL_S
                                  : MIN(data->reinit_backoff_s * 2U,
                                        (uint32_t)IQS9151_REINIT_BACKOFF_MAX_S);
-    LOG_WRN("IQS9151 reinit failed, retrying in %u s", data->reinit_backoff_s);
+    LOG_WRN("IQS9151 reinit failed (attempt %u/%u), retrying in %u s",
+            data->reinit_attempts, IQS9151_REINIT_MAX_ATTEMPTS, data->reinit_backoff_s);
     /* reinit_pending stays set: a retry is still in flight, so a fresh
      * SHOW_RESET frame (unlikely from a device this unresponsive, but
      * possible) won't spawn a second, overlapping retry chain. */
@@ -2924,6 +2953,7 @@ static int iqs9151_init(const struct device *dev) {
     k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     atomic_clear(&data->reinit_pending);
     data->reinit_backoff_s = 0U;
+    data->reinit_attempts = 0U;
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
@@ -2985,6 +3015,7 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     atomic_clear(&data->reinit_pending);
     data->reinit_backoff_s = 0U;
+    data->reinit_attempts = 0U;
     k_work_init_delayable(&data->one_finger_click_work, iqs9151_one_finger_click_work_cb);
     k_work_init_delayable(&data->two_finger_click_work, iqs9151_two_finger_click_work_cb);
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
